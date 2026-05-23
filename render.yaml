@@ -2,9 +2,7 @@ services:
   - type: web
     name: maritime-router
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --log-level info
     plan: free
-    envVars:
-      - key: PORT
-        value: 10000
+    healthCheckPath: /health
