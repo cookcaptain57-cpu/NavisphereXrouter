@@ -1,6 +1,7 @@
-flask==3.0.3
-gunicorn==21.2.0
-networkx==3.3
-shapely==2.0.4
-searoute==1.5.0
-
+flask
+searoute
+shapely
+geopandas
+fiona
+pyproj
+requests
