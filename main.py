@@ -1,8 +1,13 @@
-# maritime-router v8 — Complete Single File
-# Fixes: 1=Land crossing, 2=TSS lanes, 3=Port approach, 4=Depth+Dangers
+# maritime-router v9 — Render-compatible, production-ready
+# Fixes v8→v9:
+#   R1: Background thread init (land polygons + searoute) — port binds immediately
+#   R2: unary_union → union_all() (shapely deprecation fix)
+#   R3: Removed duplicate 'colombo' in PORT_APPROACHES
+#   R4: Gunicorn-compatible (no app.run in gunicorn path)
+#   R5: PORT env var respected correctly
 # Endpoints: GET /route, POST /safety-check, GET /health
 
-import os, sys, math, time, requests
+import os, sys, math, time, threading, requests
 from flask import Flask, request, jsonify
 from shapely.geometry import LineString
 import geopandas as gpd
@@ -18,28 +23,41 @@ def add_cors(response):
     return response
 
 # ══════════════════════════════════════════════════════════════
-# INIT: Searoute + Land Polygons
+# INIT STATE — populated by background thread (Fix R1)
 # ══════════════════════════════════════════════════════════════
-SR       = None
-SR_ERROR = None
-try:
-    import searoute as sr
-    test     = sr.searoute([2.35, 48.85], [103.82, 1.27], units='naut')
-    dist     = test.properties.get('length', 0)
-    SR       = sr
-    print(f'[maritime-router] v8 ready — test: {dist:.0f} NM', flush=True)
-except Exception as e:
-    SR_ERROR = str(e)
-    print(f'[maritime-router] searoute ERROR: {e}', file=sys.stderr, flush=True)
+SR        = None
+SR_ERROR  = None
+LAND      = None
+_init_done = False
 
-LAND = None
-try:
-    LAND = gpd.read_file(
-        "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_land.zip"
-    ).geometry.unary_union
-    print('[maritime-router] Land polygons loaded ✅', flush=True)
-except Exception as e:
-    print(f'[maritime-router] Land polygon WARNING: {e}', file=sys.stderr, flush=True)
+def _background_init():
+    global SR, SR_ERROR, LAND, _init_done
+    # 1. searoute
+    try:
+        import searoute as sr
+        test     = sr.searoute([2.35, 48.85], [103.82, 1.27], units='naut')
+        dist     = test.properties.get('length', 0)
+        SR       = sr
+        print(f'[maritime-router] v9 ready — test: {dist:.0f} NM', flush=True)
+    except Exception as e:
+        SR_ERROR = str(e)
+        print(f'[maritime-router] searoute ERROR: {e}', file=sys.stderr, flush=True)
+
+    # 2. land polygons — Fix R2: union_all() replaces deprecated unary_union
+    try:
+        gdf  = gpd.read_file(
+            "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_land.zip"
+        )
+        LAND = gdf.geometry.union_all()          # ← R2 fix
+        print('[maritime-router] Land polygons loaded ✅', flush=True)
+    except Exception as e:
+        print(f'[maritime-router] Land polygon WARNING: {e}', file=sys.stderr, flush=True)
+
+    _init_done = True
+    print('[maritime-router] Background init complete ✅', flush=True)
+
+# Start background thread immediately so Flask can bind its port first
+threading.Thread(target=_background_init, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════════
 # CONSTANTS: Chokepoints
@@ -59,7 +77,7 @@ CHOKEPOINTS = {
 }
 
 # ══════════════════════════════════════════════════════════════
-# CONSTANTS: TSS Database (Fix 2)
+# CONSTANTS: TSS Database
 # ══════════════════════════════════════════════════════════════
 TSS_DATABASE = {
     'dover_strait': {
@@ -119,7 +137,7 @@ TSS_DATABASE = {
 }
 
 # ══════════════════════════════════════════════════════════════
-# CONSTANTS: Port Approach Database (Fix 3)
+# CONSTANTS: Port Approach Database — Fix R3: removed duplicate colombo
 # ══════════════════════════════════════════════════════════════
 PORT_APPROACHES = {
     'singapore': {
@@ -176,7 +194,7 @@ PORT_APPROACHES = {
         'coord': (-74.02, 40.65),
         'approach': [(-73.80,40.30),(-73.82,40.45),(-73.90,40.55),(-74.02,40.65)],
     },
-    'colombo': {
+    'colombo': {                                 # ← R3: kept only once
         'coord': (79.85, 6.93),
         'approach': [(79.75,6.82),(79.80,6.88),(79.83,6.91),(79.85,6.93)],
     },
@@ -187,10 +205,6 @@ PORT_APPROACHES = {
     'karachi': {
         'coord': (66.99, 24.84),
         'approach': [(66.75,24.72),(66.85,24.78),(66.92,24.81),(66.99,24.84)],
-    },
-    'colombo': {
-        'coord': (79.85, 6.93),
-        'approach': [(79.75,6.82),(79.80,6.88),(79.83,6.91),(79.85,6.93)],
     },
     'aden': {
         'coord': (45.03, 12.78),
@@ -203,7 +217,7 @@ PORT_APPROACHES = {
 }
 
 # ══════════════════════════════════════════════════════════════
-# CONSTANTS: Depth + Danger (Fix 4)
+# CONSTANTS: Depth + Danger
 # ══════════════════════════════════════════════════════════════
 GEBCO_API    = "https://api.odb.ntu.edu.tw/gebco"
 OVERPASS_API = "https://overpass-api.de/api/interpreter"
@@ -547,24 +561,36 @@ def run_safety_checks(coords, draft_m=10.0, safety_m=2.0):
     }
 
 # ══════════════════════════════════════════════════════════════
-# ROUTE ENDPOINT: GET /route
+# HEALTH ENDPOINT
 # ══════════════════════════════════════════════════════════════
 @app.route('/')
 @app.route('/health')
 def health():
     return jsonify({
-        'status':     'ok' if SR else 'degraded',
-        'searoute':   SR is not None,
-        'land_check': LAND is not None,
-        'error':      SR_ERROR,
-        'service':    'maritime-router v8',
-        'fixes':      ['land-crossing','TSS-lanes','port-approach','depth-dangers'],
+        'status':      'ok' if SR else ('initializing' if not _init_done else 'degraded'),
+        'searoute':    SR is not None,
+        'land_check':  LAND is not None,
+        'init_done':   _init_done,
+        'error':       SR_ERROR,
+        'service':     'maritime-router v9',
+        'fixes':       ['land-crossing','TSS-lanes','port-approach','depth-dangers',
+                        'background-init','union_all','no-duplicate-ports'],
     })
 
+# ══════════════════════════════════════════════════════════════
+# ROUTE ENDPOINT: GET /route
+# ══════════════════════════════════════════════════════════════
 @app.route('/route')
 def route():
+    # R1: Graceful "still warming up" response instead of 503
     if SR is None:
+        if not _init_done:
+            return jsonify({
+                'error': 'Service is still initializing, please retry in ~30s',
+                'init_done': _init_done,
+            }), 503
         return jsonify({'error': f'searoute not available: {SR_ERROR}'}), 503
+
     try:
         from_lon = float(request.args['fromLon'])
         from_lat = float(request.args['fromLat'])
@@ -576,32 +602,27 @@ def route():
         return jsonify({'error': f'Missing/invalid param: {e}'}), 400
 
     try:
-        # ── Step 1: Port approach waypoints (Fix 3) ───────────
         port_data  = inject_port_approaches(from_lon, from_lat, to_lon, to_lat)
         origin_wps = port_data.get('origin', {}).get('waypoints', [])
         dest_wps   = port_data.get('destination', {}).get('waypoints', [])
         sea_from   = origin_wps[-1] if origin_wps else (from_lon, from_lat)
         sea_to     = dest_wps[0]   if dest_wps   else (to_lon,   to_lat)
 
-        # ── Step 2: TSS waypoints (Fix 2) ─────────────────────
         tss_data = inject_tss_waypoints(sea_from[0], sea_from[1],
                                         sea_to[0],   sea_to[1])
         tss_wps  = []
         for tss in tss_data:
             tss_wps.extend(tss['waypoints'])
 
-        # ── Step 3: Mandatory chokepoints (Fix 1) ─────────────
         mandatory_wps = get_mandatory_waypoints(
             sea_from[0], sea_from[1], sea_to[0], sea_to[1]
         )
 
-        # ── Step 4: Merge + sort interim waypoints ─────────────
         all_interim = list({tuple(w) for w in tss_wps + mandatory_wps})
         all_interim.sort(key=lambda w: haversine_nm(
             sea_from[1], sea_from[0], w[1], w[0]
         ))
 
-        # ── Step 5: Build chained sea route ───────────────────
         if all_interim:
             coords, dist_nm = route_via_waypoints(
                 sea_from[0], sea_from[1],
@@ -617,27 +638,22 @@ def route():
             dist_nm = float(result.properties.get('length', 0))
             method  = 'direct-searoute'
 
-        # ── Step 6: Attach port approach coords ───────────────
         origin_coords = [[w[0], w[1]] for w in origin_wps]
         dest_coords   = [[w[0], w[1]] for w in dest_wps]
         full_coords   = origin_coords + coords + dest_coords
 
-        # ── Step 7: Land check (Fix 1) ────────────────────────
         land_cross = any_segment_crosses_land(full_coords)
         if land_cross:
             print('[route] ⚠️ Land crossing detected!', file=sys.stderr, flush=True)
 
-        # ── Step 8: Simplify ──────────────────────────────────
         simplified = safe_simplify(full_coords, min_nm=5.0)
 
-        # ── Step 9: Recalculate total NM ──────────────────────
         total_nm = sum(
             haversine_nm(simplified[i][1], simplified[i][0],
                          simplified[i+1][1], simplified[i+1][0])
             for i in range(len(simplified) - 1)
         )
 
-        # ── Step 10: Depth + Danger check (Fix 4) ─────────────
         safety_report = run_safety_checks(simplified, draft, safety)
 
         print(
@@ -650,7 +666,7 @@ def route():
             'waypoints':    [{'lat': float(c[1]), 'lon': float(c[0])}
                              for c in simplified],
             'totalNM':      round(total_nm, 1),
-            'source':       'maritime-router-v8',
+            'source':       'maritime-router-v9',
             'method':       method,
             'landCrossing': land_cross,
             'tssZones':     [t['tss'] for t in tss_data],
@@ -695,7 +711,6 @@ def safety_check():
             flush=True
         )
 
-        # ── Check 1: Land ──────────────────────────────────────
         land_cross        = any_segment_crosses_land(coords)
         land_cross_points = []
         if land_cross:
@@ -707,7 +722,6 @@ def safety_check():
                         'segment_index': i,
                     })
 
-        # ── Check 2: TSS ───────────────────────────────────────
         tss_hits   = inject_tss_waypoints(
             coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]
         )
@@ -717,7 +731,6 @@ def safety_check():
             'note':         f"Route crosses {t['tss']} — verify {t['lane']} lane",
         } for t in tss_hits]
 
-        # ── Check 3: Port approach ─────────────────────────────
         port_data  = inject_port_approaches(
             coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]
         )
@@ -731,10 +744,8 @@ def safety_check():
                     'note':   f"Verify {role} via {pd.get('port')} pilot/fairway",
                 })
 
-        # ── Check 4: Depth + Dangers ───────────────────────────
         safety_report = run_safety_checks(coords, draft, safety)
 
-        # ── Route stats ────────────────────────────────────────
         total_nm   = 0.0
         max_leg_nm = 0.0
         legs       = []
@@ -750,7 +761,6 @@ def safety_check():
                 'bearing': round(bearing_two_points(c1, c2), 1),
             })
 
-        # ── All warnings ───────────────────────────────────────
         all_warnings = []
         if land_cross:
             all_warnings.append(
@@ -829,7 +839,8 @@ def safety_check():
         return jsonify({'error': str(e)}), 500
 
 # ══════════════════════════════════════════════════════════════
-# RUN
+# ENTRY POINT — Fix R4: gunicorn imports app directly,
+# only runs app.run() when executed as a script locally
 # ══════════════════════════════════════════════════════════════
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
