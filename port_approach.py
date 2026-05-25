@@ -180,7 +180,16 @@ PORT_APPROACHES = {
         ],
         'fairway_heading': 30,
     },
-
+'felixstowe': {
+    'coord': (1.35, 51.96),
+    'approach': [
+        (1.90, 51.75),   # outer Cork Sand
+        (1.65, 51.85),   # Harwich approach
+        (1.50, 51.90),   # deep water channel
+        (1.42, 51.94),   # pilot boarding
+        (1.35, 51.96),   # port entrance
+    ],
+},
     'mumbai': {
         'coord': (72.85, 18.92),
         'pilot': (72.75, 18.80),
