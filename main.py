@@ -628,7 +628,7 @@ def route():
             print('[route] ⚠️ Land crossing detected!', file=sys.stderr, flush=True)
 
         # ── Step 8: Simplify ──────────────────────────────────
-        simplified = safe_simplify(full_coords, min_nm=2.0)
+        simplified = safe_simplify(full_coords, min_nm=5.0)
 
         # ── Step 9: Recalculate total NM ──────────────────────
         total_nm = sum(
