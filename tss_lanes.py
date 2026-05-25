@@ -46,19 +46,21 @@ TSS_DATABASE = {
         ],
     },
 
-    'gibraltar': {
-        'bbox': (-6.0, 35.7, -5.2, 36.2),
-        'eastbound': [    # entering Mediterranean
-            (-5.90, 35.98),
-            (-5.60, 35.97),
-            (-5.35, 35.96),
-        ],
-        'westbound': [    # exiting to Atlantic
-            (-5.35, 36.02),
-            (-5.65, 36.03),
-            (-5.90, 36.04),
-        ],
-    },
+'gibraltar': {
+    'bbox': (-6.0, 35.7, -5.2, 36.2),
+    'eastbound': [   # Atlantic → Mediterranean (CORRECT lane - southern side)
+        (-6.00, 35.92),
+        (-5.75, 35.93),
+        (-5.50, 35.94),
+        (-5.35, 35.95),
+    ],
+    'westbound': [   # Mediterranean → Atlantic (CORRECT lane - northern side)
+        (-5.35, 36.02),
+        (-5.60, 36.03),
+        (-5.85, 36.04),
+        (-6.05, 36.05),
+    ],
+},
 
     'malacca_strait': {
         'bbox': (98.0, 1.0, 104.5, 6.5),
