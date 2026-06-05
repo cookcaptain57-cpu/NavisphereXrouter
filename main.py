@@ -534,7 +534,8 @@ def safety_ep():
 # ══════════════════════════════════════════════════════════════
 # GET /health
 # ══════════════════════════════════════════════════════════════
-@app.route("/"); @app.route("/health")
+@app.route("/")
+@app.route("/health")
 def health():
     return jsonify({
         "status":      "ok" if READY else "initializing",
