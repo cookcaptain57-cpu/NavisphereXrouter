@@ -10,57 +10,11 @@ def cors(r):
     r.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return r
 
-# ── Load graph ────────────────────────────────────────────────
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE  = os.path.dirname(os.path.abspath(__file__))
 NODES = {}
 ADJ   = {}
 GRAPH_NAME = ""
 READY = False
-
-def load_graph():
-    global NODES, ADJ, GRAPH_NAME, READY
-    # Try worldroutens.json first (marnet — clean ocean lanes)
-    # Fall back to world_graph_v2.json
-    for fname in ["worldroutens.json", "world_graph_v2.json"]:
-        fpath = os.path.join(BASE, fname)
-        if not os.path.exists(fpath):
-            continue
-        try:
-            print(f"[router] Loading {fname}...", flush=True)
-            with open(fpath) as f:
-                db = json.load(f)
-
-            # Handle both key formats: 'n'/'e' or 'nodes'/'edges'
-            raw_nodes = db.get("n") or db.get("nodes") or []
-            raw_edges = db.get("e") or db.get("edges") or []
-
-            for row in raw_nodes:
-                if len(row) == 4:
-                    nid, name, lat, lon = row
-                elif len(row) == 3:
-                    nid, lat, lon = row
-                    name = ""
-                else:
-                    continue
-                NODES[nid] = (float(lat), float(lon), str(name or ""))
-                ADJ[nid]   = []
-
-            for row in raw_edges:
-                f, t, d = row[0], row[1], row[2]
-                if f in ADJ and t in ADJ:
-                    ADJ[f].append((t, float(d)))
-                    ADJ[t].append((f, float(d)))
-
-            GRAPH_NAME = fname
-            READY = True
-            print(f"[router] Ready — {len(NODES):,} nodes from {fname}", flush=True)
-            return
-        except Exception as e:
-            print(f"[router] Error loading {fname}: {e}", file=sys.stderr, flush=True)
-
-    print("[router] ERROR: No graph file found!", file=sys.stderr, flush=True)
-
-threading.Thread(target=load_graph, daemon=True).start()
 
 # ── Haversine ─────────────────────────────────────────────────
 def hav(lat1, lon1, lat2, lon2):
@@ -71,13 +25,100 @@ def hav(lat1, lon1, lat2, lon2):
          math.sin(math.radians((lon2-lon1)/2))**2)
     return R * 2 * math.asin(math.sqrt(max(0, a)))
 
-# ── nearestNode ───────────────────────────────────────────────
+# ── Graph loader — handles GeoJSON and plain JSON formats ─────
+def load_geojson(db):
+    """Parse GeoJSON FeatureCollection of LineStrings."""
+    nodes = {}; adj = {}; coord_to_id = {}; nid = 0
+
+    def get_node(lon, lat):
+        nonlocal nid
+        key = (round(lon, 3), round(lat, 3))
+        if key not in coord_to_id:
+            coord_to_id[key] = nid
+            nodes[nid] = (float(lat), float(lon), "")
+            adj[nid] = []
+            nid += 1
+        return coord_to_id[key]
+
+    for feat in db.get("features", []):
+        geom = feat.get("geometry", {})
+        gtype = geom.get("type", "")
+        coords = geom.get("coordinates", [])
+        if gtype == "LineString":
+            segments = [coords]
+        elif gtype == "MultiLineString":
+            segments = coords
+        else:
+            continue
+        for seg in segments:
+            prev = None
+            for pt in seg:
+                lon, lat = float(pt[0]), float(pt[1])
+                ni = get_node(lon, lat)
+                if prev is not None and prev != ni:
+                    d = hav(nodes[prev][0], nodes[prev][1],
+                            nodes[ni][0],   nodes[ni][1])
+                    if 0 < d < 500:
+                        adj[prev].append((ni, d))
+                        adj[ni].append((prev, d))
+                prev = ni
+    return nodes, adj
+
+def load_plain(db):
+    """Parse plain JSON with n/nodes and e/edges keys."""
+    nodes = {}; adj = {}
+    raw_nodes = db.get("n") or db.get("nodes") or []
+    raw_edges = db.get("e") or db.get("edges") or []
+    for row in raw_nodes:
+        if len(row) == 4:
+            nid, name, lat, lon = row
+        elif len(row) == 3:
+            nid, lat, lon = row; name = ""
+        else:
+            continue
+        nodes[nid] = (float(lat), float(lon), str(name or ""))
+        adj[nid] = []
+    for row in raw_edges:
+        f, t, d = row[0], row[1], row[2]
+        if f in adj and t in adj:
+            adj[f].append((t, float(d)))
+            adj[t].append((f, float(d)))
+    return nodes, adj
+
+def load_graph():
+    global NODES, ADJ, GRAPH_NAME, READY
+    for fname in ["worldroutens.json", "world_graph_v2.json"]:
+        fpath = os.path.join(BASE, fname)
+        if not os.path.exists(fpath):
+            continue
+        try:
+            print(f"[router] Loading {fname}...", flush=True)
+            with open(fpath) as f:
+                db = json.load(f)
+            # Detect format
+            if db.get("type") == "FeatureCollection":
+                nodes, adj = load_geojson(db)
+            else:
+                nodes, adj = load_plain(db)
+            if len(nodes) == 0:
+                print(f"[router] {fname} gave 0 nodes, skipping", flush=True)
+                continue
+            NODES = nodes; ADJ = adj; GRAPH_NAME = fname
+            READY = True
+            print(f"[router] Ready — {len(NODES):,} nodes from {fname}", flush=True)
+            return
+        except Exception as e:
+            print(f"[router] Error: {e}", file=sys.stderr, flush=True)
+    print("[router] ERROR: no graph loaded", file=sys.stderr, flush=True)
+
+threading.Thread(target=load_graph, daemon=True).start()
+
+# ── Routing ───────────────────────────────────────────────────
 def nearest_nodes(lat, lon, k=5):
     dists = [(hav(lat, lon, NODES[i][0], NODES[i][1]), i) for i in NODES]
     dists.sort()
     return [i for _, i in dists[:k]]
 
-# ── A* ────────────────────────────────────────────────────────
 def astar(start, end):
     elat, elon = NODES[end][0], NODES[end][1]
     h = lambda n: hav(NODES[n][0], NODES[n][1], elat, elon)
@@ -99,7 +140,6 @@ def astar(start, end):
     path.append(start)
     return list(reversed(path)), g[end]
 
-# ── Route ─────────────────────────────────────────────────────
 def compute_route(flat, flon, tlat, tlon):
     fc = nearest_nodes(flat, flon, 5)
     tc = nearest_nodes(tlat, tlon, 5)
@@ -109,8 +149,8 @@ def compute_route(flat, flon, tlat, tlon):
             if n1 == n2: continue
             path, dist = astar(n1, n2)
             if path is None: continue
-            d1    = hav(flat, flon, NODES[n1][0], NODES[n1][1])
-            d2    = hav(tlat, tlon, NODES[n2][0], NODES[n2][1])
+            d1 = hav(flat, flon, NODES[n1][0], NODES[n1][1])
+            d2 = hav(tlat, tlon, NODES[n2][0], NODES[n2][1])
             total = d1 + dist + d2
             if total < best_nm:
                 best_nm = total; best_path = path
@@ -121,7 +161,6 @@ def compute_route(flat, flon, tlat, tlon):
     coords.append([tlon, tlat])
     return coords, best_nm
 
-# ── RDP simplify ──────────────────────────────────────────────
 def rdp(coords, eps=1.5):
     if len(coords) <= 2: return coords
     def pd(p, a, b):
@@ -135,11 +174,10 @@ def rdp(coords, eps=1.5):
         for i in range(1, len(pts)-1):
             d = pd(pts[i], pts[0], pts[-1])
             if d > dm: dm, idx = d, i
-        if dm > e: return _r(pts[:idx+1],e)[:-1] + _r(pts[idx:],e)
+        if dm > e: return _r(pts[:idx+1],e)[:-1]+_r(pts[idx:],e)
         return [pts[0], pts[-1]]
     return _r(coords, eps)
 
-# ── TSS check ─────────────────────────────────────────────────
 OVP = "https://overpass-api.de/api/interpreter"
 _TC = {}
 
@@ -164,11 +202,11 @@ def check_tss(coords, buf=0.3):
     except: pass
     _TC[key]=zs; return zs
 
-# ── /route ────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────
 @app.route("/route")
 def route_ep():
     if not READY:
-        return jsonify({"error": "Graph loading — retry in 30s"}), 503
+        return jsonify({"error":"Graph loading — retry in 30s"}), 503
     try:
         flat  = float(request.args["fromLat"])
         flon  = float(request.args["fromLon"])
@@ -178,20 +216,14 @@ def route_ep():
         do_tss = request.args.get("tss","true").lower() == "true"
     except (KeyError, ValueError) as ex:
         return jsonify({"error": f"Bad param: {ex}"}), 400
-
-    coords, dist_nm = compute_route(flat, flon, tlat, tlon)
+    coords, _ = compute_route(flat, flon, tlat, tlon)
     if coords is None:
-        return jsonify({"error": "No route found"}), 404
-
+        return jsonify({"error":"No route found"}), 404
     simp = rdp(coords, eps)
-    total_nm = sum(
-        hav(simp[i][1],simp[i][0],simp[i+1][1],simp[i+1][0])
-        for i in range(len(simp)-1)
-    )
+    total_nm = sum(hav(simp[i][1],simp[i][0],simp[i+1][1],simp[i+1][0])
+                   for i in range(len(simp)-1))
     tss = check_tss(simp) if do_tss else []
-
     print(f"[router] {total_nm:.0f} NM | {len(coords)}→{len(simp)} pts", flush=True)
-
     return jsonify({
         "waypoints":   [{"lat":float(c[1]),"lon":float(c[0])} for c in simp],
         "totalNM":     round(total_nm, 1),
@@ -205,7 +237,6 @@ def route_ep():
         "landCrossing": False,
     })
 
-# ── /safety-check ─────────────────────────────────────────────
 @app.route("/safety-check", methods=["POST","OPTIONS"])
 def safety_ep():
     if request.method == "OPTIONS": return jsonify({}), 200
@@ -219,34 +250,26 @@ def safety_ep():
         tss    = check_tss(coords)
         eta    = lambda nm,kn: round(nm/kn,1) if kn>0 else None
         return jsonify({
-            "overall_safe":   True,
+            "overall_safe": True,
             "total_warnings": len(tss),
-            "warnings":       [f"🚢 TSS: {z}" for z in tss],
-            "route_stats": {
-                "total_nm":       round(total,1),
-                "waypoint_count": len(coords),
-                "eta": {"10kn":eta(total,10),"12kn":eta(total,12),
-                        "15kn":eta(total,15),"18kn":eta(total,18)},
-            },
+            "warnings": [f"🚢 TSS: {z}" for z in tss],
+            "route_stats": {"total_nm":round(total,1),"waypoint_count":len(coords),
+                "eta":{"10kn":eta(total,10),"12kn":eta(total,12),
+                       "15kn":eta(total,15),"18kn":eta(total,18)}},
             "land_check":   {"safe":True,"problem_segments":[]},
             "tss_check":    {"zones_found":len(tss),"zones":tss},
             "depth_check":  {"safe":True},
             "danger_check": {"safe":True,"dangers":[]},
         })
     except Exception as ex:
-        return jsonify({"error": str(ex)}), 500
+        return jsonify({"error":str(ex)}), 500
 
-# ── /health ───────────────────────────────────────────────────
 @app.route("/")
 @app.route("/health")
 def health():
-    return jsonify({
-        "status":  "ok" if READY else "loading",
-        "service": "NavisphereX Router",
-        "graph":   GRAPH_NAME,
-        "nodes":   len(NODES),
-        "ready":   READY,
-    })
+    return jsonify({"status":"ok" if READY else "loading",
+                    "service":"NavisphereX Router",
+                    "graph":GRAPH_NAME,"nodes":len(NODES),"ready":READY})
 
 if __name__ == "__main__":
     load_graph()
