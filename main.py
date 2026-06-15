@@ -15,7 +15,8 @@ NODES      = {}
 ADJ        = {}
 GRAPH_NAME = ""
 LAND       = None
-READY      = False
+GRAPH_READY = False
+LAND_READY  = False
 
 def hav(lat1, lon1, lat2, lon2):
     R = 3440.065
@@ -24,7 +25,8 @@ def hav(lat1, lon1, lat2, lon2):
          math.sin(math.radians((lon2-lon1)/2))**2)
     return R * 2 * math.asin(math.sqrt(max(0, a)))
 
-def edge_crosses_land(lon1, lat1, lon2, lat2):
+def crosses_land(lon1, lat1, lon2, lat2):
+    """Check if a segment crosses land. Used only for access legs."""
     if LAND is None:
         return False
     try:
@@ -33,22 +35,9 @@ def edge_crosses_land(lon1, lat1, lon2, lat2):
     except:
         return False
 
+# ── Load graph (fast — no edge land checking) ─────────────────
 def load_graph():
-    global NODES, ADJ, GRAPH_NAME, LAND, READY
-
-    # Step 1 — load land polygons first
-    try:
-        import geopandas as gpd
-        print("[router] Loading land polygons...", flush=True)
-        gdf  = gpd.read_file(
-            "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_land.zip"
-        )
-        LAND = gdf.geometry.union_all()
-        print(f"[router] Land polygons loaded ✅", flush=True)
-    except Exception as e:
-        print(f"[router] Land WARNING: {e}", file=sys.stderr, flush=True)
-
-    # Step 2 — load graph
+    global NODES, ADJ, GRAPH_NAME, GRAPH_READY
     for fname in ["worldroutens.json", "world_graph_v2.json"]:
         fpath = os.path.join(BASE, fname)
         if not os.path.exists(fpath):
@@ -57,88 +46,95 @@ def load_graph():
             print(f"[router] Loading {fname}...", flush=True)
             with open(fpath) as f:
                 db = json.load(f)
-
             nodes = {}; adj = {}
-
             if db.get("type") == "FeatureCollection":
                 coord_to_id = {}; nid = 0
-
                 def get_node(lon, lat):
                     nonlocal nid
                     key = (round(lon, 4), round(lat, 4))
                     if key not in coord_to_id:
                         coord_to_id[key] = nid
                         nodes[nid] = (float(lat), float(lon), "")
-                        adj[nid]   = []
-                        nid += 1
+                        adj[nid] = []; nid += 1
                     return coord_to_id[key]
-
-                removed = 0
                 for feat in db.get("features", []):
                     geom  = feat.get("geometry", {})
-                    gtype = geom.get("type", "")
-                    coords = geom.get("coordinates", [])
-                    segs  = [coords] if gtype == "LineString" \
-                            else coords if gtype == "MultiLineString" else []
+                    gtype = geom.get("type","")
+                    coords = geom.get("coordinates",[])
+                    segs = [coords] if gtype=="LineString" \
+                           else coords if gtype=="MultiLineString" else []
                     for seg in segs:
                         prev = None
                         for pt in seg:
                             ni = get_node(float(pt[0]), float(pt[1]))
                             if prev is not None and prev != ni:
-                                n1 = nodes[prev]
-                                n2 = nodes[ni]
-                                d  = hav(n1[0],n1[1],n2[0],n2[1])
-                                if d < 500:
-                                    # KEY FIX: skip edges that cross land
-                                    if edge_crosses_land(n1[1],n1[0],n2[1],n2[0]):
-                                        removed += 1
-                                    else:
-                                        adj[prev].append((ni, d))
-                                        adj[ni].append((prev, d))
+                                d = hav(nodes[prev][0],nodes[prev][1],
+                                        nodes[ni][0],nodes[ni][1])
+                                if 0 < d < 500:
+                                    adj[prev].append((ni, d))
+                                    adj[ni].append((prev, d))
                             prev = ni
-
-                print(f"[router] Removed {removed} land-crossing edges", flush=True)
-
             else:
                 for row in (db.get("n") or db.get("nodes") or []):
-                    if len(row) == 4: nid2,name,lat,lon = row
-                    elif len(row) == 3: nid2,lat,lon = row; name=""
+                    if len(row)==4: nid2,name,lat,lon=row
+                    elif len(row)==3: nid2,lat,lon=row; name=""
                     else: continue
-                    nodes[nid2] = (float(lat),float(lon),str(name or ""))
-                    adj[nid2]   = []
-                removed = 0
+                    nodes[nid2]=(float(lat),float(lon),str(name or ""))
+                    adj[nid2]=[]
                 for row in (db.get("e") or db.get("edges") or []):
-                    f,t,d = row[0],row[1],row[2]
-                    if f not in adj or t not in adj: continue
-                    n1,n2 = nodes[f],nodes[t]
-                    if edge_crosses_land(n1[1],n1[0],n2[1],n2[0]):
-                        removed += 1
-                    else:
+                    f,t,d=row[0],row[1],row[2]
+                    if f in adj and t in adj:
                         adj[f].append((t,float(d)))
                         adj[t].append((f,float(d)))
-                print(f"[router] Removed {removed} land-crossing edges", flush=True)
-
-            if len(nodes) == 0:
-                print(f"[router] {fname} gave 0 nodes", flush=True); continue
-
-            NODES      = nodes
-            ADJ        = adj
-            GRAPH_NAME = fname
-            READY      = True
-            print(f"[router] Ready — {len(NODES):,} nodes, {sum(len(v) for v in ADJ.values())//2:,} edges", flush=True)
+            if len(nodes)==0:
+                print(f"[router] {fname}: 0 nodes, skip", flush=True); continue
+            NODES=nodes; ADJ=adj; GRAPH_NAME=fname; GRAPH_READY=True
+            print(f"[router] Graph ready — {len(NODES):,} nodes", flush=True)
             return
-
         except Exception as e:
-            print(f"[router] Error loading {fname}: {e}", file=sys.stderr, flush=True)
+            print(f"[router] Error: {e}", file=sys.stderr, flush=True)
 
-    print("[router] ERROR: no graph loaded", file=sys.stderr, flush=True)
+# ── Load land polygons (slow — background, after graph) ───────
+def load_land():
+    global LAND, LAND_READY
+    try:
+        import geopandas as gpd
+        print("[router] Loading land polygons...", flush=True)
+        gdf  = gpd.read_file(
+            "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_land.zip"
+        )
+        LAND = gdf.geometry.union_all()
+        LAND_READY = True
+        print("[router] Land polygons ready ✅", flush=True)
+    except Exception as e:
+        print(f"[router] Land WARNING: {e}", file=sys.stderr, flush=True)
 
-threading.Thread(target=load_graph, daemon=True).start()
+def bg_init():
+    load_graph()
+    load_land()   # land loads AFTER graph — server is already up
 
-def nearest_nodes(lat, lon, k=5):
+threading.Thread(target=bg_init, daemon=True).start()
+
+# ── Nearest nodes — prefer those reachable without land ───────
+def nearest_nodes(lat, lon, k=8):
     dists = sorted([(hav(lat,lon,NODES[i][0],NODES[i][1]),i) for i in NODES])
-    return [i for _,i in dists[:k]]
+    # First try to get k nodes whose access leg doesn't cross land
+    result = []
+    for d, i in dists:
+        if len(result) >= k: break
+        nd = NODES[i]
+        if not crosses_land(lon, lat, nd[1], nd[0]):
+            result.append((d, i))
+    # If not enough safe nodes, add remaining without land check
+    if len(result) < k:
+        used = {i for _,i in result}
+        for d, i in dists:
+            if len(result) >= k: break
+            if i not in used:
+                result.append((d, i))
+    return result
 
+# ── A* ────────────────────────────────────────────────────────
 def astar(start, end):
     elat,elon = NODES[end][0],NODES[end][1]
     h = lambda n: hav(NODES[n][0],NODES[n][1],elat,elon)
@@ -148,7 +144,7 @@ def astar(start, end):
         _,u = heapq.heappop(pq)
         if u in vis: continue
         vis.add(u)
-        if u == end: break
+        if u==end: break
         for v,w in ADJ.get(u,[]):
             ng = g[u]+w
             if ng < g.get(v,float("inf")):
@@ -164,18 +160,16 @@ def compute_route(flat,flon,tlat,tlon):
     fc = nearest_nodes(flat,flon,5)
     tc = nearest_nodes(tlat,tlon,5)
     best_path,best_nm = None,float("inf")
-    for n1 in fc:
-        for n2 in tc:
+    for d1,n1 in fc:
+        for d2,n2 in tc:
             if n1==n2: continue
             path,dist = astar(n1,n2)
             if path is None: continue
-            d1 = hav(flat,flon,NODES[n1][0],NODES[n1][1])
-            d2 = hav(tlat,tlon,NODES[n2][0],NODES[n2][1])
             total = d1+dist+d2
             if total < best_nm:
                 best_nm=total; best_path=path
     if best_path is None: return None,float("inf")
-    coords = [[flon,flat]]
+    coords=[[flon,flat]]
     for nid in best_path:
         coords.append([NODES[nid][1],NODES[nid][0]])
     coords.append([tlon,tlat])
@@ -220,8 +214,8 @@ def check_tss(coords,buf=0.3):
 
 @app.route("/route")
 def route_ep():
-    if not READY:
-        return jsonify({"error":"Loading — retry in 60s"}),503
+    if not GRAPH_READY:
+        return jsonify({"error":"Graph loading — retry in 30s"}),503
     try:
         flat=float(request.args["fromLat"]); flon=float(request.args["fromLon"])
         tlat=float(request.args["toLat"]);   tlon=float(request.args["toLon"])
@@ -233,7 +227,8 @@ def route_ep():
     if coords is None:
         return jsonify({"error":"No route found"}),404
     simp=rdp(coords,eps)
-    total_nm=sum(hav(simp[i][1],simp[i][0],simp[i+1][1],simp[i+1][0]) for i in range(len(simp)-1))
+    total_nm=sum(hav(simp[i][1],simp[i][0],simp[i+1][1],simp[i+1][0])
+                 for i in range(len(simp)-1))
     tss=check_tss(simp) if do_tss else []
     print(f"[router] {total_nm:.0f} NM | {len(coords)}→{len(simp)} pts",flush=True)
     return jsonify({"waypoints":[{"lat":float(c[1]),"lon":float(c[0])} for c in simp],
@@ -247,15 +242,18 @@ def safety_ep():
     try:
         body=request.get_json(force=True) or {}
         raw=body.get("waypoints",[])
-        if len(raw)<2: return jsonify({"error":"Need 2+ waypoints"}),400
+        if len(raw)<2: return jsonify({"error":"Need 2+"}),400
         coords=[[float(w["lon"]),float(w["lat"])] for w in raw]
-        total=sum(hav(coords[i][1],coords[i][0],coords[i+1][1],coords[i+1][0]) for i in range(len(coords)-1))
+        total=sum(hav(coords[i][1],coords[i][0],coords[i+1][1],coords[i+1][0])
+                  for i in range(len(coords)-1))
         tss=check_tss(coords); eta=lambda nm,kn:round(nm/kn,1) if kn>0 else None
         return jsonify({"overall_safe":True,"total_warnings":len(tss),
             "warnings":[f"🚢 TSS: {z}" for z in tss],
             "route_stats":{"total_nm":round(total,1),"waypoint_count":len(coords),
-                "eta":{"10kn":eta(total,10),"12kn":eta(total,12),"15kn":eta(total,15),"18kn":eta(total,18)}},
-            "land_check":{"safe":True,"problem_segments":[]},"tss_check":{"zones_found":len(tss),"zones":tss},
+                "eta":{"10kn":eta(total,10),"12kn":eta(total,12),
+                       "15kn":eta(total,15),"18kn":eta(total,18)}},
+            "land_check":{"safe":True,"problem_segments":[]},
+            "tss_check":{"zones_found":len(tss),"zones":tss},
             "depth_check":{"safe":True},"danger_check":{"safe":True,"dangers":[]}})
     except Exception as ex:
         return jsonify({"error":str(ex)}),500
@@ -263,10 +261,6 @@ def safety_ep():
 @app.route("/")
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok" if READY else "loading","service":"NavisphereX Router",
-        "graph":GRAPH_NAME,"nodes":len(NODES),"land_loaded":LAND is not None,"ready":READY})
-
-if __name__=="__main__":
-    load_graph()
-    port=int(os.environ.get("PORT",10000))
-    app.run(host="0.0.0.0",port=port,debug=False)
+    return jsonify({"status":"ok" if GRAPH_READY else "loading",
+        "service":"NavisphereX Router","graph":GRAPH_NAME,
+        "nodes":len(NODES),"land_loaded":LAND_READY,"ready":GRAPH_READY})
